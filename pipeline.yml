@@ -1,0 +1,144 @@
+resource_types:
+  - name: registry-image
+    type: docker-image
+    source:
+      repository: concourse/registry-image-resource
+
+resources:
+  - name: release-repo
+    type: git
+    source:
+      uri: https://github.com/asdf57/testing.git
+      branch: main
+      tag_filter: "v*"
+      fetch_tags: true
+  - name: prereqs-image
+    type: registry-image
+    source:
+      repository: registry.ryuugu.dev/prereqs
+      tag: latest
+  - name: final-image
+    type: registry-image
+    source:
+      repository: registry.ryuugu.dev/final
+      tag: latest
+
+jobs:
+  - name: conditional-build
+    plan:
+      - get: release-repo
+        trigger: true
+      - task: detect-diff
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: { repository: debian }
+          inputs:
+            - name: release-repo
+          outputs:
+            - name: flags
+          run:
+            path: /bin/bash
+            args:
+              - -exc
+              - |
+                apt-get update
+                apt-get install -y git
+                cd release-repo
+                cur_tag=$(git tag --sort=-creatordate | head -n 1)
+                prev_tag=$(git tag --sort=-creatordate | head -n 2 | tail -n 1)
+                echo "Comparing $prev_tag to $cur_tag..."
+                mkdir -p ../flags
+                
+                # Check if prereqs changed
+                if git diff --name-only "$prev_tag" "$cur_tag" | grep -q "^t2$"; then
+                  echo "Detected change in prereqs"
+                  touch ../flags/prereqs_changed
+                fi
+
+      - task: build-prereqs
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: { repository: concourse/oci-build-task }
+          inputs:
+            - name: release-repo
+            - name: flags
+          outputs:
+            - name: image
+            - name: status
+          params:
+            CONTEXT: release-repo
+            DOCKERFILE: release-repo/Dockerfile.reqs
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                mkdir -p status
+                if [ ! -f flags/prereqs_changed ]; then
+                  echo "No prereqs change detected. Skipping build."
+                  echo "SKIP" > status/prereqs_status
+                  # Create empty image directory structure to avoid put errors
+                  mkdir -p image
+                  exit 0
+                fi
+                echo "Building prereqs image..."
+                build
+                echo "BUILT" > status/prereqs_status
+
+      - try:
+          do:
+            - task: check-prereqs-status
+              config:
+                platform: linux
+                image_resource:
+                  type: registry-image
+                  source: { repository: debian }
+                inputs:
+                  - name: status
+                run:
+                  path: sh
+                  args:
+                    - -exc
+                    - |
+                      if [ "$(cat status/prereqs_status)" = "BUILT" ]; then
+                        echo "Prereqs image was built, proceeding with put"
+                        exit 0
+                      else
+                        echo "Prereqs image was skipped, failing to skip put"
+                        exit 1
+                      fi
+
+            - put: prereqs-image
+              params:
+                image: image/image.tar
+
+      - task: build-final
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: { repository: concourse/oci-build-task }
+          inputs:
+            - name: release-repo
+          outputs:
+            - name: image
+          params:
+            CONTEXT: release-repo
+            DOCKERFILE: release-repo/Dockerfile
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                echo "Building final image..."
+                build
+
+      - put: final-image
+        params:
+          image: image/image.tar
