@@ -1,4 +1,4 @@
-FROM harbor.ryuugu.dev/test/prereqs:latest
+FROM registry.ryuugu.dev/prereqs:latest
 
 RUN echo "This is the final image layer." > /final.txt
 
